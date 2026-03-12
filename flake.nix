@@ -133,7 +133,7 @@
         let
           cfg = config.services.open-claw-voice;
           # Get the package for the current system
-          pkg = self.packages.${pkgs.system}.default;
+          pkg = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
         in {
           options.services.open-claw-voice = {
             enable = mkEnableOption "OpenClaw Voice service";
