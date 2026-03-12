@@ -3,3 +3,10 @@
 state.txt
 __pycache__/
 *.pyc
+
+# Nix build artifacts
+result
+result-*
+
+# Keep example files tracked
+!.env.example

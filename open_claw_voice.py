@@ -28,17 +28,118 @@ from dotenv import load_dotenv  # type: ignore
 
 from config import Config, parse_args
 
-# Load environment
-load_dotenv()
+# API keys - loaded after environment setup in main()
+STT_API_KEY: Optional[str] = None
+TTS_API_KEY: Optional[str] = None
+OPENCLAW_TOKEN: Optional[str] = None
 
-# API keys from environment
-STT_API_KEY = os.getenv("STT_API_KEY")
-TTS_API_KEY = os.getenv("TTS_API_KEY")
-OPENCLAW_TOKEN = os.getenv("OPENCLAW_TOKEN")
 
-# State file for Quickshell UI
-STATE_FILE = Path(__file__).parent / "state.txt"
-LOG_FILE = Path(__file__).parent / "open_claw_voice.log"
+def is_development_mode() -> bool:
+    """Check if running in development mode (local directory)."""
+    # Explicit dev mode flag
+    if os.getenv("OPEN_CLAW_VOICE_DEV"):
+        return True
+    # If QML path is set, we're in packaged mode
+    if os.getenv("OPEN_CLAW_VOICE_QML_PATH"):
+        return False
+    # Default to dev mode (running script directly)
+    return True
+
+
+def get_state_file() -> Path:
+    """Get state file path (runtime, ephemeral state for UI)."""
+    if is_development_mode():
+        return Path(__file__).parent / "state.txt"
+
+    # Production: use XDG runtime directory
+    runtime_dir = os.getenv("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    state_dir = Path(runtime_dir) / "open-claw-voice"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir / "state.txt"
+
+
+def get_log_file() -> Path:
+    """Get log file path (persistent state)."""
+    if is_development_mode():
+        return Path(__file__).parent / "open_claw_voice.log"
+
+    # Production: use XDG state directory
+    state_home = os.getenv("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
+    log_dir = Path(state_home) / "open-claw-voice"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / "open_claw_voice.log"
+
+
+def get_qml_file() -> Path:
+    """Get QML UI file path."""
+    # Explicit environment variable (set by Nix wrapper)
+    if qml_path := os.getenv("OPEN_CLAW_VOICE_QML_PATH"):
+        return Path(qml_path)
+
+    # Development: use script directory
+    return Path(__file__).parent / "shell.qml"
+
+
+def load_environment(env_file: Optional[Path] = None) -> None:
+    """
+    Load environment variables from .env file.
+
+    Priority order:
+    1. Explicit env_file path (if provided via --env-file)
+    2. XDG config directory: $XDG_CONFIG_HOME/open-claw-voice/.env
+    3. Home config directory: ~/.config/open-claw-voice/.env
+    4. Current directory: ./.env (for development)
+
+    If no .env file is found, environment variables must be set externally
+    (e.g., via systemd EnvironmentFile or shell exports).
+    """
+    logger = logging.getLogger(__name__)
+
+    if env_file and env_file.exists():
+        load_dotenv(env_file)
+        logger.info(f"Loaded environment from: {env_file}")
+        return
+
+    # Try XDG config directory
+    xdg_config = os.getenv("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+    xdg_env = Path(xdg_config) / "open-claw-voice" / ".env"
+
+    # Try standard config directory (in case XDG_CONFIG_HOME is set to something else)
+    home_env = Path.home() / ".config" / "open-claw-voice" / ".env"
+
+    # Try script directory (development)
+    script_env = Path(__file__).parent / ".env"
+
+    # Try current directory (development fallback)
+    local_env = Path.cwd() / ".env"
+
+    for env_path in [xdg_env, home_env, script_env, local_env]:
+        if env_path.exists():
+            load_dotenv(env_path)
+            logger.info(f"Loaded environment from: {env_path}")
+            return
+
+    logger.info("No .env file found, expecting environment variables to be set externally")
+
+
+def setup_logging(use_log_file: bool = True) -> None:
+    """Set up logging configuration."""
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+
+    if use_log_file:
+        log_file = get_log_file()
+        handlers.append(logging.FileHandler(log_file))
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=handlers,
+    )
+
+
+# State file for Quickshell UI (computed lazily)
+STATE_FILE: Path  # Set during startup
+LOG_FILE: Path  # Set during startup
 
 # System prompt for voice agent
 SYSTEM_PROMPT = """You are a helpful voice assistant. Keep your responses concise and conversational since the user is listening, not reading.
@@ -64,15 +165,7 @@ class State(Enum):
     ERROR = "error"
 
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
+# Logger will be configured in main() via setup_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -214,53 +307,69 @@ class OpenClawVoice:
                 async def receive_transcripts():
                     """Receive and process Deepgram responses."""
                     nonlocal final_transcript, speech_started
-                    
+                    listening_timeout = cfg.stt.listening_timeout_seconds
+                    speech_started_time: Optional[float] = None
+
                     try:
-                        async for msg in ws:
+                        while True:
                             if self.interrupt_event.is_set():
                                 break
-                                
+
+                            # Check listening timeout (time since SpeechStarted with no utterance)
+                            if speech_started_time is not None:
+                                elapsed = asyncio.get_event_loop().time() - speech_started_time
+                                if elapsed >= listening_timeout:
+                                    logger.info(f"Listening timeout after {elapsed:.1f}s with no utterance")
+                                    return
+
+                            # Receive with short timeout so we can check for listening timeout
+                            try:
+                                msg = await asyncio.wait_for(ws.recv(), timeout=0.5)
+                            except asyncio.TimeoutError:
+                                continue
+
                             data = json.loads(msg)
                             msg_type = data.get("type")
-                            
+
                             # Handle VAD speech start
                             if msg_type == "SpeechStarted":
                                 if not speech_started:
                                     speech_started = True
+                                    speech_started_time = asyncio.get_event_loop().time()
                                     self.speech_detected_event.set()
                                     await self.set_state(State.LISTENING)
                                     logger.info("Speech started")
-                            
+
                             # Handle transcription results
                             elif msg_type == "Results":
                                 channel = data.get("channel", {})
                                 alternatives = channel.get("alternatives", [])
-                                
+
                                 if alternatives:
                                     transcript = alternatives[0].get("transcript", "")
                                     is_final = data.get("is_final", False)
                                     speech_final = data.get("speech_final", False)
-                                    
+
                                     if transcript:
                                         if is_final:
                                             transcript_parts.append(transcript)
                                             logger.debug(f"Final segment: {transcript}")
                                         else:
                                             logger.debug(f"Interim: {transcript}")
-                                    
+
                                     # Speech final means user stopped talking
                                     if speech_final:
                                         final_transcript = " ".join(transcript_parts)
                                         logger.info(f"Speech ended: {final_transcript}")
                                         return
-                            
+
                             # Handle utterance end (backup for speech_final)
                             elif msg_type == "UtteranceEnd":
                                 if transcript_parts:
                                     final_transcript = " ".join(transcript_parts)
                                     logger.info(f"Utterance end: {final_transcript}")
                                     return
-                                    
+
                     except websockets.exceptions.ConnectionClosed:
                         pass
                     except Exception as e:
@@ -647,7 +756,8 @@ class OpenClawVoice:
         logger.info(f"Config: llm_url={cfg.llm.url}")
 
         # Start Quickshell overlay as subprocess
-        shell_qml = Path(__file__).parent / "shell.qml"
+        shell_qml = get_qml_file()
+        logger.info(f"Using QML file: {shell_qml}")
         self.quickshell_proc = await asyncio.create_subprocess_exec(
             "quickshell", "-p", str(shell_qml),
             stdout=asyncio.subprocess.DEVNULL,
@@ -698,7 +808,25 @@ class OpenClawVoice:
 
 
 async def main():
+    global STT_API_KEY, TTS_API_KEY, OPENCLAW_TOKEN, STATE_FILE, LOG_FILE
+
     args = parse_args()
+
+    # Set up logging first (before any log messages)
+    setup_logging(use_log_file=not args.no_log_file)
+
+    # Initialize global path variables
+    STATE_FILE = get_state_file()
+    LOG_FILE = get_log_file()
+
+    # Load environment variables from .env file
+    load_environment(args.env_file)
+
+    # Now load API keys from environment
+    STT_API_KEY = os.getenv("STT_API_KEY")
+    TTS_API_KEY = os.getenv("TTS_API_KEY")
+    OPENCLAW_TOKEN = os.getenv("OPENCLAW_TOKEN")
+
     config = Config.load(args.config)
     logger.info(f"Loaded config from: {args.config or 'default'}")
 

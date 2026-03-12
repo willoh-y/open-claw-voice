@@ -22,6 +22,7 @@ class STTConfig:
     language: str = "en"
     endpointing_ms: int = 1500
     max_session_seconds: int = 300
+    listening_timeout_seconds: float = 10.0  # Timeout after SpeechStarted if no utterance ends
 
 
 @dataclass
@@ -112,6 +113,19 @@ def parse_args() -> argparse.Namespace:
         "--config",
         type=Path,
         default=None,
-        help="Path to config file (default: config.yaml in script directory)",
+        help="Path to config file (default: ~/.config/open-claw-voice/config.yaml)",
+    )
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=None,
+        dest="env_file",
+        help="Path to .env file with API keys (default: ~/.config/open-claw-voice/.env)",
+    )
+    parser.add_argument(
+        "--no-log-file",
+        action="store_true",
+        dest="no_log_file",
+        help="Don't write to log file, use stdout only (for systemd services)",
     )
     return parser.parse_args()
