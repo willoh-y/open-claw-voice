@@ -6,8 +6,14 @@
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+    }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
@@ -16,9 +22,9 @@
 
         # Runtime dependencies needed for the application
         runtimeDeps = with pkgs; [
-          pipewire      # pw-record, pw-play
-          ffmpeg        # ffplay (for Edge TTS)
-          quickshell    # UI overlay
+          pipewire # pw-record, pw-play
+          ffmpeg # ffplay (for Edge TTS)
+          quickshell # UI overlay
         ];
 
         # Build the main application package
@@ -31,14 +37,18 @@
           nativeBuildInputs = [ pkgs.makeWrapper ];
 
           buildInputs = [
-            (python.withPackages (ps: with ps; [
-              numpy
-              websockets
-              aiohttp
-              python-dotenv
-              edge-tts
-              pyyaml
-            ]))
+            (python.withPackages (
+              ps: with ps; [
+                numpy
+                websockets
+                aiohttp
+                python-dotenv
+                edge-tts
+                pyyaml
+                webrtcvad
+                setuptools
+              ]
+            ))
           ];
 
           # No build step needed
@@ -62,14 +72,19 @@
 
             # Create wrapper script
             mkdir -p $out/bin
-            makeWrapper ${python.withPackages (ps: with ps; [
-              numpy
-              websockets
-              aiohttp
-              python-dotenv
-              edge-tts
-              pyyaml
-            ])}/bin/python $out/bin/open-claw-voice \
+            makeWrapper ${
+              python.withPackages (
+                ps: with ps; [
+                  numpy
+                  websockets
+                  aiohttp
+                  python-dotenv
+                  edge-tts
+                  pyyaml
+                  webrtcvad
+                ]
+              )
+            }/bin/python $out/bin/open-claw-voice \
               --add-flags "$out/lib/open-claw-voice/open_claw_voice.py" \
               --prefix PATH : ${pkgs.lib.makeBinPath runtimeDeps} \
               --set OPEN_CLAW_VOICE_QML_PATH "$out/share/open-claw-voice/shell.qml"
@@ -85,7 +100,8 @@
           };
         };
 
-      in {
+      in
+      {
         # Main package
         packages = {
           default = open-claw-voice;
@@ -95,14 +111,18 @@
         # Development shell
         devShells.default = pkgs.mkShell {
           buildInputs = runtimeDeps ++ [
-            (python.withPackages (ps: with ps; [
-              numpy
-              websockets
-              aiohttp
-              python-dotenv
-              edge-tts
-              pyyaml
-            ]))
+            (python.withPackages (
+              ps: with ps; [
+                numpy
+                websockets
+                aiohttp
+                python-dotenv
+                edge-tts
+                pyyaml
+                webrtcvad
+                setuptools
+              ]
+            ))
           ];
 
           shellHook = ''
@@ -126,15 +146,23 @@
           '';
         };
       }
-    ) // {
+    )
+    // {
       # NixOS module (system-independent)
-      nixosModules.default = { config, lib, pkgs, ... }:
+      nixosModules.default =
+        {
+          config,
+          lib,
+          pkgs,
+          ...
+        }:
         with lib;
         let
           cfg = config.services.open-claw-voice;
           # Get the package for the current system
           pkg = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-        in {
+        in
+        {
           options.services.open-claw-voice = {
             enable = mkEnableOption "OpenClaw Voice service";
 
@@ -188,7 +216,10 @@
             systemd.user.services.open-claw-voice = {
               description = "OpenClaw Voice - Voice chat with OpenClaw";
               wantedBy = [ "default.target" ];
-              after = [ "pipewire.service" "pipewire-pulse.service" ];
+              after = [
+                "pipewire.service"
+                "pipewire-pulse.service"
+              ];
               requires = [ "pipewire.service" ];
 
               serviceConfig = {
@@ -196,10 +227,10 @@
                 ExecStart =
                   let
                     args = lib.concatStringsSep " " (
-                      [ "--no-log-file" ]
-                      ++ lib.optional (cfg.configFile != null) "--config ${cfg.configFile}"
+                      [ "--no-log-file" ] ++ lib.optional (cfg.configFile != null) "--config ${cfg.configFile}"
                     );
-                  in "${cfg.package}/bin/open-claw-voice ${args}";
+                  in
+                  "${cfg.package}/bin/open-claw-voice ${args}";
 
                 Restart = "on-failure";
                 RestartSec = "5s";
@@ -209,7 +240,8 @@
                 # Using KillMode=process so signals only go to main process by default
                 KillMode = "process";
                 KillSignal = "SIGTERM";
-              } // lib.optionalAttrs (cfg.environmentFile != null) {
+              }
+              // lib.optionalAttrs (cfg.environmentFile != null) {
                 EnvironmentFile = cfg.environmentFile;
               };
 

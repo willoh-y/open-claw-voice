@@ -5,18 +5,32 @@ audio:
   gate_threshold: 200
 
 stt:
+  provider: "whisper"  # or "deepgram"
   model: "nova-3"
   language: "en"
   endpointing_ms: 1500
   max_session_seconds: 300
+  listening_timeout_seconds: 10.0
+  whisper:
+    url: "http://127.0.0.1:8178"
+    inference_path: "/inference"
+    response_format: "text"
+    temperature: 0.0
+    temperature_inc: 0.2
+    request_timeout_seconds: 120
+  vad:
+    aggressiveness: 2
+    frame_ms: 30
+    pre_speech_ms: 300
+    min_speech_ms: 200
 
 tts:
   provider: "elevenlabs"  # or "edge"
   elevenlabs:
-    voice_id: "lLgB6ZeIe84FSJa9pO1a"
+    voice_id: "DWE9K7cSWwOb3HxtnOdw"
     model: "eleven_flash_v2_5"
-    stability: 0.7
-    similarity_boost: 0.75
+    stability: 0.5
+    similarity_boost: 1.0
   edge:
     voice: "en-US-ChristopherNeural"
 

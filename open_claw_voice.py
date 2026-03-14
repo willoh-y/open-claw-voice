@@ -5,21 +5,24 @@ OpenClaw Voice - Voice chat with OpenClaw
 Flow:
 1. Start in dormant mode (not listening)
 2. SIGUSR1 toggles active/dormant state
-3. When active: stream mic audio to Deepgram STT
+3. When active: stream mic audio to selected STT provider
 4. On speech end (endpointing), send transcript to OpenClaw
 5. Stream OpenClaw response to ElevenLabs TTS
 6. Play audio, allow interrupts to go back to listening
 """
 
 import asyncio
+import io
 import json
 import logging
 import os
 import signal
 import sys
+import wave
+from collections import deque
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 import aiohttp  # type: ignore
 import numpy as np  # type: ignore
@@ -254,11 +257,86 @@ class OpenClawVoice:
         )
         return proc
 
+    def _create_vad(self):
+        import webrtcvad  # type: ignore
+
+        cfg = self.config.stt.vad
+        return webrtcvad.Vad(cfg.aggressiveness)
+
+    def _get_vad_frame_bytes(self) -> Optional[int]:
+        cfg = self.config
+        frame_ms = cfg.stt.vad.frame_ms
+
+        if cfg.audio.channels != 1:
+            logger.error("Local VAD requires mono audio (channels=1)")
+            return None
+
+        if frame_ms not in (10, 20, 30):
+            logger.error("VAD frame_ms must be 10, 20, or 30")
+            return None
+
+        if cfg.audio.sample_rate not in (8000, 16000, 32000, 48000):
+            logger.error("VAD sample rate must be 8000, 16000, 32000, or 48000")
+            return None
+
+        frame_samples = int(cfg.audio.sample_rate * (frame_ms / 1000.0))
+        return frame_samples * 2
+
+    async def _audio_frame_stream(
+        self,
+        mic_proc: asyncio.subprocess.Process,
+        frame_bytes: int,
+    ) -> AsyncIterator[bytes]:
+        buffer = b""
+        while not self.interrupt_event.is_set():
+            if mic_proc.stdout is None:
+                break
+            chunk = await mic_proc.stdout.read(4096)
+            if not chunk:
+                break
+            buffer += chunk
+            while len(buffer) >= frame_bytes:
+                frame = buffer[:frame_bytes]
+                buffer = buffer[frame_bytes:]
+                yield frame
+
+    def _build_wav_bytes(self, frames: list[bytes]) -> bytes:
+        cfg = self.config.audio
+        with io.BytesIO() as wav_buffer:
+            with wave.open(wav_buffer, "wb") as wav_file:
+                wav_file.setnchannels(cfg.channels)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(cfg.sample_rate)
+                wav_file.writeframes(b"".join(frames))
+            return wav_buffer.getvalue()
+
+    def _whisper_inference_url(self) -> str:
+        whisper_cfg = self.config.stt.whisper
+        base = whisper_cfg.url.rstrip("/")
+        inference_path = whisper_cfg.inference_path
+        if not inference_path.startswith("/"):
+            inference_path = f"/{inference_path}"
+        return f"{base}{inference_path}"
+
     async def run_stt(self) -> Optional[str]:
+        """Run speech-to-text using the configured provider."""
+        provider = self.config.stt.provider
+        if provider == "whisper":
+            return await self.run_stt_whisper()
+        if provider == "deepgram":
+            return await self.run_stt_deepgram()
+        logger.error(f"Unknown STT provider: {provider}")
+        return None
+
+    async def run_stt_deepgram(self) -> Optional[str]:
         """
         Stream audio to Deepgram and return final transcript.
         Returns None if interrupted or no speech detected.
         """
+        if not STT_API_KEY:
+            logger.error("STT_API_KEY is required for Deepgram provider")
+            return None
+
         cfg = self.config
         url = (
             f"wss://api.deepgram.com/v1/listen"
@@ -278,17 +356,19 @@ class OpenClawVoice:
         speech_started = False
 
         mic_proc = await self.stream_microphone()
-        
+
         try:
             async with websockets.connect(
                 url,
                 additional_headers={"Authorization": f"Token {STT_API_KEY}"},
             ) as ws:
-                
+
                 async def send_audio():
                     """Send audio chunks to Deepgram with noise gating."""
                     try:
                         while self.running and not self.interrupt_event.is_set():
+                            if mic_proc.stdout is None:
+                                break
                             chunk = await mic_proc.stdout.read(4096)
                             if not chunk:
                                 break
@@ -307,20 +387,12 @@ class OpenClawVoice:
                 async def receive_transcripts():
                     """Receive and process Deepgram responses."""
                     nonlocal final_transcript, speech_started
-                    listening_timeout = cfg.stt.listening_timeout_seconds
                     speech_started_time: Optional[float] = None
 
                     try:
                         while True:
                             if self.interrupt_event.is_set():
                                 break
-
-                            # Check listening timeout (time since SpeechStarted with no utterance)
-                            if speech_started_time is not None:
-                                elapsed = asyncio.get_event_loop().time() - speech_started_time
-                                if elapsed >= listening_timeout:
-                                    logger.info(f"Listening timeout after {elapsed:.1f}s with no utterance")
-                                    return
 
                             # Receive with short timeout so we can check for listening timeout
                             try:
@@ -378,20 +450,20 @@ class OpenClawVoice:
                 # Run send and receive concurrently
                 send_task = asyncio.create_task(send_audio())
                 receive_task = asyncio.create_task(receive_transcripts())
-                
+
                 # Wait for receive to complete (speech ended) or interrupt
-                done, pending = await asyncio.wait(
+                await asyncio.wait(
                     [receive_task],
                     timeout=cfg.stt.max_session_seconds,
                 )
-                
+
                 # Cancel send task
                 send_task.cancel()
                 try:
                     await send_task
                 except asyncio.CancelledError:
                     pass
-                    
+
         except Exception as e:
             logger.error(f"STT error: {e}")
             return None
@@ -404,6 +476,136 @@ class OpenClawVoice:
                 mic_proc.kill()
 
         return final_transcript if final_transcript.strip() else None
+
+    async def run_stt_whisper(self) -> Optional[str]:
+        """Record audio, apply local VAD, and transcribe via whisper-server."""
+        cfg = self.config
+        frame_bytes = self._get_vad_frame_bytes()
+        if frame_bytes is None:
+            return None
+
+        vad = self._create_vad()
+        frame_ms = cfg.stt.vad.frame_ms
+        pre_speech_frames = max(0, int(cfg.stt.vad.pre_speech_ms / frame_ms))
+        pre_speech_buffer: deque[bytes] = deque(maxlen=pre_speech_frames)
+        min_speech_frames = max(1, int(cfg.stt.vad.min_speech_ms / frame_ms))
+        candidate_frames: list[bytes] = []
+        candidate_speech_frames = 0
+        candidate_start_time: Optional[float] = None
+        audio_frames: list[bytes] = []
+        speech_started = False
+        speech_start_time: Optional[float] = None
+        last_speech_time: Optional[float] = None
+
+        start_time = asyncio.get_event_loop().time()
+        mic_proc = await self.stream_microphone()
+
+        try:
+            async for frame in self._audio_frame_stream(mic_proc, frame_bytes):
+                if self.interrupt_event.is_set():
+                    break
+
+                gated_frame = self.apply_noise_gate(frame)
+
+                if not speech_started:
+                    pre_speech_buffer.append(gated_frame)
+
+                try:
+                    is_speech = vad.is_speech(gated_frame, cfg.audio.sample_rate)
+                except Exception as e:
+                    logger.error(f"VAD error: {e}")
+                    return None
+
+                now = asyncio.get_event_loop().time()
+
+                if speech_started:
+                    audio_frames.append(gated_frame)
+                    if is_speech:
+                        last_speech_time = now
+
+                    if last_speech_time is not None:
+                        silence_ms = (now - last_speech_time) * 1000.0
+                        if silence_ms >= cfg.stt.endpointing_ms:
+                            logger.info("Speech ended (local VAD)")
+                            break
+                    if speech_start_time is not None:
+                        if (now - speech_start_time) >= cfg.stt.max_session_seconds:
+                            logger.info("Max session duration reached")
+                            break
+                    continue
+
+                if is_speech:
+                    if candidate_start_time is None:
+                        candidate_start_time = now
+                        candidate_speech_frames = 0
+                        candidate_frames = []
+
+                    candidate_speech_frames += 1
+                    candidate_frames.append(gated_frame)
+
+                    if candidate_speech_frames >= min_speech_frames:
+                        speech_started = True
+                        speech_start_time = candidate_start_time
+                        last_speech_time = now
+                        self.speech_detected_event.set()
+                        await self.set_state(State.LISTENING)
+                        audio_frames.extend(pre_speech_buffer)
+                        audio_frames.extend(candidate_frames)
+                else:
+                    if candidate_start_time is not None:
+                        candidate_start_time = None
+                        candidate_speech_frames = 0
+                        candidate_frames = []
+
+        finally:
+            mic_proc.terminate()
+            try:
+                await asyncio.wait_for(mic_proc.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                mic_proc.kill()
+
+        if not speech_started or not audio_frames:
+            return None
+
+        wav_bytes = self._build_wav_bytes(audio_frames)
+        whisper_cfg = cfg.stt.whisper
+        url = self._whisper_inference_url()
+
+        form = aiohttp.FormData()
+        form.add_field("file", wav_bytes, filename="speech.wav", content_type="audio/wav")
+        form.add_field("response_format", whisper_cfg.response_format)
+        form.add_field("temperature", str(whisper_cfg.temperature))
+        form.add_field("temperature_inc", str(whisper_cfg.temperature_inc))
+
+        try:
+            session = await self.get_http_session()
+            async with session.post(
+                url,
+                data=form,
+                timeout=aiohttp.ClientTimeout(total=whisper_cfg.request_timeout_seconds),
+            ) as resp:
+                if resp.status != 200:
+                    error = await resp.text()
+                    logger.error(f"Whisper server error {resp.status}: {error}")
+                    return None
+
+                if whisper_cfg.response_format in {"json", "verbose_json"}:
+                    data = await resp.json()
+                    transcript = data.get("text", "")
+                else:
+                    transcript = await resp.text()
+
+        except Exception as e:
+            logger.error(f"Whisper request failed: {e}")
+            return None
+
+        transcript = transcript.strip()
+        if transcript in {"", "[BLANK_AUDIO]"}:
+            logger.info("Whisper transcript was blank")
+            return None
+
+        logger.info(f"Whisper transcript: {transcript}")
+        return transcript
 
     async def query_openclaw(self, text: str) -> Optional[str]:
         """Send text to OpenClaw and get response."""
@@ -535,43 +737,43 @@ class OpenClawVoice:
                     "output_format": "pcm_44100",
                 },
             ) as resp:
-                    if resp.status != 200:
-                        error = await resp.text()
-                        logger.error(f"TTS error {resp.status}: {error}")
-                        return
-                    
-                    # Stream audio chunks to player
-                    chunk_count = 0
-                    async for chunk in resp.content.iter_chunked(4096):
-                        if self.interrupt_event.is_set():
-                            logger.info(f"TTS interrupted after {chunk_count} chunks")
-                            break
-                        
-                        if player_proc.stdin:
-                            player_proc.stdin.write(chunk)
-                            await player_proc.stdin.drain()
-                        chunk_count += 1
-                    
-                    logger.info(f"TTS stream finished: {chunk_count} chunks received")
-                    
-                    # Close stdin to signal EOF, then wait for player to finish
+                if resp.status != 200:
+                    error = await resp.text()
+                    logger.error(f"TTS error {resp.status}: {error}")
+                    return
+
+                # Stream audio chunks to player
+                chunk_count = 0
+                async for chunk in resp.content.iter_chunked(4096):
+                    if self.interrupt_event.is_set():
+                        logger.info(f"TTS interrupted after {chunk_count} chunks")
+                        break
+
                     if player_proc.stdin:
-                        player_proc.stdin.close()
-                    
-                    # Wait for playback to complete, checking for interrupts
-                    while player_proc.returncode is None:
-                        if self.interrupt_event.is_set():
-                            logger.info("TTS playback interrupted")
-                            player_proc.terminate()
-                            break
-                        try:
-                            await asyncio.wait_for(player_proc.wait(), timeout=0.1)
-                        except asyncio.TimeoutError:
-                            pass
-                    
-                    logger.info("TTS playback finished")
-                    return  # Clean exit, skip finally termination
-                    
+                        player_proc.stdin.write(chunk)
+                        await player_proc.stdin.drain()
+                    chunk_count += 1
+
+                logger.info(f"TTS stream finished: {chunk_count} chunks received")
+
+                # Close stdin to signal EOF, then wait for player to finish
+                if player_proc.stdin:
+                    player_proc.stdin.close()
+
+                # Wait for playback to complete, checking for interrupts
+                while player_proc.returncode is None:
+                    if self.interrupt_event.is_set():
+                        logger.info("TTS playback interrupted")
+                        player_proc.terminate()
+                        break
+                    try:
+                        await asyncio.wait_for(player_proc.wait(), timeout=0.1)
+                    except asyncio.TimeoutError:
+                        pass
+
+                logger.info("TTS playback finished")
+                return  # Clean exit, skip finally termination
+
         except Exception as e:
             logger.error(f"TTS error: {e}")
         finally:
@@ -588,106 +790,48 @@ class OpenClawVoice:
     async def listen_for_interrupt(self) -> None:
         """
         Monitor for speech during TTS playback to trigger interrupt.
-        This runs a lightweight STT connection just for VAD.
+        Uses local VAD to avoid STT provider dependencies.
         """
         cfg = self.config
-        url = (
-            f"wss://api.deepgram.com/v1/listen"
-            f"?encoding=linear16"
-            f"&sample_rate={cfg.audio.sample_rate}"
-            f"&channels={cfg.audio.channels}"
-            f"&model={cfg.stt.model}"
-            f"&vad_events=true"
-        )
-        
+        frame_bytes = self._get_vad_frame_bytes()
+        if frame_bytes is None:
+            return
+
+        vad = self._create_vad()
+        sustained_threshold = cfg.interrupt.sustained_threshold_seconds
         mic_proc = await self.stream_microphone()
-        
+        speech_start_time: Optional[float] = None
+
         try:
-            async with websockets.connect(
-                url,
-                additional_headers={"Authorization": f"Token {STT_API_KEY}"},
-            ) as ws:
-                
-                async def send_audio():
-                    try:
-                        while not self.interrupt_event.is_set():
-                            chunk = await mic_proc.stdout.read(4096)
-                            if not chunk:
-                                break
-                            # Apply noise gate before sending
-                            gated_chunk = self.apply_noise_gate(chunk)
-                            await ws.send(gated_chunk)
-                    except (asyncio.CancelledError, websockets.exceptions.ConnectionClosed):
-                        pass
-                    except Exception as e:
-                        logger.debug(f"Interrupt audio send stopped: {e}")
+            async for frame in self._audio_frame_stream(mic_proc, frame_bytes):
+                if self.interrupt_event.is_set():
+                    break
 
-                async def check_vad():
-                    try:
-                        speech_start_time = None
-                        sustained_threshold = cfg.interrupt.sustained_threshold_seconds
+                gated_frame = self.apply_noise_gate(frame)
 
-                        async def process_messages():
-                            nonlocal speech_start_time
-                            async for msg in ws:
-                                if self.interrupt_event.is_set():
-                                    return
-                                data = json.loads(msg)
-                                msg_type = data.get("type")
-
-                                if msg_type == "SpeechStarted":
-                                    speech_start_time = asyncio.get_event_loop().time()
-                                    logger.debug("Potential interrupt: speech started")
-
-                                elif msg_type == "SpeechEnded":
-                                    # Speech ended before threshold - reset
-                                    if speech_start_time is not None:
-                                        duration = asyncio.get_event_loop().time() - speech_start_time
-                                        logger.debug(f"Speech ended after {duration:.2f}s (below threshold)")
-                                    speech_start_time = None
-
-                        async def check_duration():
-                            nonlocal speech_start_time
-                            while not self.interrupt_event.is_set():
-                                await asyncio.sleep(0.05)  # Check every 50ms
-                                if speech_start_time is not None:
-                                    duration = asyncio.get_event_loop().time() - speech_start_time
-                                    if duration >= sustained_threshold:
-                                        logger.info(f"Interrupt: sustained speech detected ({duration:.2f}s)")
-                                        self.interrupt_event.set()
-                                        return
-
-                        # Run message processing and duration checking concurrently
-                        msg_task = asyncio.create_task(process_messages())
-                        duration_task = asyncio.create_task(check_duration())
-
-                        await asyncio.wait(
-                            [msg_task, duration_task],
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
-
-                        msg_task.cancel()
-                        duration_task.cancel()
-                    except (asyncio.CancelledError, websockets.exceptions.ConnectionClosed):
-                        pass
-                    except Exception as e:
-                        logger.debug(f"Interrupt VAD check stopped: {e}")
-
-                send_task = asyncio.create_task(send_audio())
-                vad_task = asyncio.create_task(check_vad())
-                
-                # Wait for interrupt or TTS to finish
-                await asyncio.wait(
-                    [vad_task],
-                    timeout=300,
-                )
-                
-                send_task.cancel()
                 try:
-                    await send_task
-                except asyncio.CancelledError:
-                    pass
-                    
+                    is_speech = vad.is_speech(gated_frame, cfg.audio.sample_rate)
+                except Exception as e:
+                    logger.debug(f"Interrupt VAD error: {e}")
+                    break
+
+                now = asyncio.get_event_loop().time()
+
+                if is_speech:
+                    if speech_start_time is None:
+                        speech_start_time = now
+                        logger.debug("Potential interrupt: speech started")
+                    elif (now - speech_start_time) >= sustained_threshold:
+                        duration = now - speech_start_time
+                        logger.info(f"Interrupt: sustained speech detected ({duration:.2f}s)")
+                        self.interrupt_event.set()
+                        break
+                else:
+                    if speech_start_time is not None:
+                        duration = now - speech_start_time
+                        logger.debug(f"Speech ended after {duration:.2f}s (below threshold)")
+                    speech_start_time = None
+
         except Exception as e:
             logger.debug(f"Interrupt listener error: {e}")
         finally:
@@ -750,7 +894,11 @@ class OpenClawVoice:
         cfg = self.config
         logger.info("OpenClaw Voice starting...")
         logger.info(f"Config: mic_device={cfg.audio.mic_device}")
-        logger.info(f"Config: stt_model={cfg.stt.model}, endpointing={cfg.stt.endpointing_ms}ms")
+        logger.info(
+            "Config: stt_provider="
+            f"{cfg.stt.provider}, stt_model={cfg.stt.model}, "
+            f"endpointing={cfg.stt.endpointing_ms}ms"
+        )
         logger.info(f"Config: tts_provider={cfg.tts.provider}")
         logger.info(f"Config: gate_threshold={cfg.audio.gate_threshold} RMS")
         logger.info(f"Config: llm_url={cfg.llm.url}")

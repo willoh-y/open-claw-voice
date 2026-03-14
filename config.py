@@ -17,12 +17,33 @@ class AudioConfig:
 
 
 @dataclass
+class WhisperConfig:
+    url: str = "http://127.0.0.1:8178"
+    inference_path: str = "/inference"
+    response_format: str = "text"
+    temperature: float = 0.0
+    temperature_inc: float = 0.2
+    request_timeout_seconds: int = 120
+
+
+@dataclass
+class STTVADConfig:
+    aggressiveness: int = 2
+    frame_ms: int = 30
+    pre_speech_ms: int = 300
+    min_speech_ms: int = 200
+
+
+@dataclass
 class STTConfig:
+    provider: str = "deepgram"
     model: str = "nova-3"
     language: str = "en"
     endpointing_ms: int = 1500
     max_session_seconds: int = 300
     listening_timeout_seconds: float = 10.0  # Timeout after SpeechStarted if no utterance ends
+    whisper: WhisperConfig = field(default_factory=WhisperConfig)
+    vad: STTVADConfig = field(default_factory=STTVADConfig)
 
 
 @dataclass
@@ -75,13 +96,26 @@ class Config:
         llm_data = data.get("llm", {})
         interrupt_data = data.get("interrupt", {})
 
+        # Handle nested STT config
+        whisper_data = stt_data.get("whisper", {})
+        vad_data = stt_data.get("vad", {})
+
         # Handle nested TTS config
         elevenlabs_data = tts_data.get("elevenlabs", {})
         edge_data = tts_data.get("edge", {})
 
         return cls(
             audio=AudioConfig(**audio_data),
-            stt=STTConfig(**stt_data),
+            stt=STTConfig(
+                provider=stt_data.get("provider", "deepgram"),
+                model=stt_data.get("model", "nova-3"),
+                language=stt_data.get("language", "en"),
+                endpointing_ms=stt_data.get("endpointing_ms", 1500),
+                max_session_seconds=stt_data.get("max_session_seconds", 300),
+                listening_timeout_seconds=stt_data.get("listening_timeout_seconds", 10.0),
+                whisper=WhisperConfig(**whisper_data),
+                vad=STTVADConfig(**vad_data),
+            ),
             tts=TTSConfig(
                 provider=tts_data.get("provider", "elevenlabs"),
                 elevenlabs=ElevenLabsConfig(**elevenlabs_data),
